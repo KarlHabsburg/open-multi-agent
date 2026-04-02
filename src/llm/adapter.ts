@@ -42,8 +42,12 @@ export type SupportedProvider = 'anthropic' | 'copilot' | 'openai'
 /**
  * Instantiate the appropriate {@link LLMAdapter} for the given provider.
  *
- * API keys fall back to the standard environment variables
- * (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY`) when not supplied explicitly.
+ * API keys fall back to the standard environment variables when not supplied
+ * explicitly:
+ * - `anthropic` → `ANTHROPIC_API_KEY`
+ * - `openai`    → `OPENAI_API_KEY`
+ * - `copilot`   → `GITHUB_COPILOT_TOKEN` / `GITHUB_TOKEN`, or interactive
+ *                  OAuth2 device flow if neither is set
  *
  * Adapters are imported lazily so that projects using only one provider
  * are not forced to install the SDK for the other.

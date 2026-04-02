@@ -3,18 +3,20 @@
  *
  * Uses the OpenAI-compatible Copilot Chat Completions endpoint at
  * `https://api.githubcopilot.com`. Authentication requires a GitHub token
- * (e.g. from `gh auth token`) which is exchanged for a short-lived Copilot
- * session token via the internal token endpoint.
+ * which is exchanged for a short-lived Copilot session token via the
+ * internal token endpoint.
  *
  * API key resolution order:
  *   1. `apiKey` constructor argument
- *   2. `GITHUB_TOKEN` environment variable
+ *   2. `GITHUB_COPILOT_TOKEN` environment variable
+ *   3. `GITHUB_TOKEN` environment variable
+ *   4. Interactive OAuth2 device flow (prompts the user to sign in)
  *
  * @example
  * ```ts
  * import { CopilotAdapter } from './copilot.js'
  *
- * const adapter = new CopilotAdapter()          // uses GITHUB_TOKEN env var
+ * const adapter = new CopilotAdapter()          // uses GITHUB_COPILOT_TOKEN, falling back to GITHUB_TOKEN
  * const response = await adapter.chat(messages, {
  *   model: 'claude-sonnet-4',
  *   maxTokens: 4096,
@@ -24,14 +26,7 @@
 
 import OpenAI from 'openai'
 import type {
-  ChatCompletion,
-  ChatCompletionAssistantMessageParam,
   ChatCompletionChunk,
-  ChatCompletionMessageParam,
-  ChatCompletionMessageToolCall,
-  ChatCompletionTool,
-  ChatCompletionToolMessageParam,
-  ChatCompletionUserMessageParam,
 } from 'openai/resources/chat/completions/index.js'
 
 import type {
@@ -46,6 +41,13 @@ import type {
   TextBlock,
   ToolUseBlock,
 } from '../types.js'
+
+import {
+  toOpenAITool,
+  fromOpenAICompletion,
+  normalizeFinishReason,
+  buildOpenAIMessageList,
+} from './openai-common.js'
 
 // ---------------------------------------------------------------------------
 // Copilot auth — OAuth2 device flow + token exchange
@@ -82,21 +84,37 @@ interface PollResponse {
 }
 
 /**
+ * Callback invoked when the OAuth2 device flow needs the user to authorize.
+ * Receives the verification URI and user code. If not provided, defaults to
+ * printing them to stdout.
+ */
+export type DeviceCodeCallback = (verificationUri: string, userCode: string) => void
+
+const defaultDeviceCodeCallback: DeviceCodeCallback = (uri, code) => {
+  console.log(`\n┌─────────────────────────────────────────────┐`)
+  console.log(`│  GitHub Copilot — Sign in                    │`)
+  console.log(`│                                              │`)
+  console.log(`│  Open:  ${uri.padEnd(35)}│`)
+  console.log(`│  Code:  ${code.padEnd(35)}│`)
+  console.log(`└─────────────────────────────────────────────┘\n`)
+}
+
+/**
  * Start the GitHub OAuth2 device code flow with the Copilot client ID.
  *
- * Prints a user code and URL to stdout, then polls until the user completes
- * authorization in their browser. Returns a GitHub OAuth token scoped for
- * Copilot access.
+ * Calls `onDeviceCode` with the verification URI and user code, then polls
+ * until the user completes authorization. Returns a GitHub OAuth token
+ * scoped for Copilot access.
  */
-async function deviceCodeLogin(): Promise<string> {
+async function deviceCodeLogin(onDeviceCode: DeviceCodeCallback): Promise<string> {
   // Step 1: Request a device code
   const codeRes = await fetch(DEVICE_CODE_URL, {
     method: 'POST',
     headers: {
       Accept: 'application/json',
-      'Content-Type': 'application/json',
+      'Content-Type': 'application/x-www-form-urlencoded',
     },
-    body: JSON.stringify({ client_id: COPILOT_CLIENT_ID, scope: 'copilot' }),
+    body: new URLSearchParams({ client_id: COPILOT_CLIENT_ID, scope: 'copilot' }),
   })
 
   if (!codeRes.ok) {
@@ -106,13 +124,8 @@ async function deviceCodeLogin(): Promise<string> {
 
   const codeData = (await codeRes.json()) as DeviceCodeResponse
 
-  // Step 2: Prompt the user
-  console.log(`\n┌─────────────────────────────────────────────┐`)
-  console.log(`│  GitHub Copilot — Sign in                    │`)
-  console.log(`│                                              │`)
-  console.log(`│  Open:  ${codeData.verification_uri.padEnd(35)}│`)
-  console.log(`│  Code:  ${codeData.user_code.padEnd(35)}│`)
-  console.log(`└─────────────────────────────────────────────┘\n`)
+  // Step 2: Prompt the user via callback
+  onDeviceCode(codeData.verification_uri, codeData.user_code)
 
   // Step 3: Poll for the user to complete auth
   const interval = (codeData.interval || 5) * 1000
@@ -125,9 +138,9 @@ async function deviceCodeLogin(): Promise<string> {
       method: 'POST',
       headers: {
         Accept: 'application/json',
-        'Content-Type': 'application/json',
+        'Content-Type': 'application/x-www-form-urlencoded',
       },
-      body: JSON.stringify({
+      body: new URLSearchParams({
         client_id: COPILOT_CLIENT_ID,
         device_code: codeData.device_code,
         grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
@@ -183,188 +196,34 @@ async function fetchCopilotToken(githubToken: string): Promise<CopilotTokenRespo
 }
 
 // ---------------------------------------------------------------------------
-// Internal helpers — framework → OpenAI (shared with openai.ts pattern)
-// ---------------------------------------------------------------------------
-
-function toOpenAITool(tool: LLMToolDef): ChatCompletionTool {
-  return {
-    type: 'function',
-    function: {
-      name: tool.name,
-      description: tool.description,
-      parameters: tool.inputSchema as Record<string, unknown>,
-    },
-  }
-}
-
-function hasToolResults(msg: LLMMessage): boolean {
-  return msg.content.some((b) => b.type === 'tool_result')
-}
-
-function toOpenAIMessages(messages: LLMMessage[]): ChatCompletionMessageParam[] {
-  const result: ChatCompletionMessageParam[] = []
-
-  for (const msg of messages) {
-    if (msg.role === 'assistant') {
-      result.push(toOpenAIAssistantMessage(msg))
-    } else {
-      if (!hasToolResults(msg)) {
-        result.push(toOpenAIUserMessage(msg))
-      } else {
-        const nonToolBlocks = msg.content.filter((b) => b.type !== 'tool_result')
-        if (nonToolBlocks.length > 0) {
-          result.push(toOpenAIUserMessage({ role: 'user', content: nonToolBlocks }))
-        }
-        for (const block of msg.content) {
-          if (block.type === 'tool_result') {
-            const toolMsg: ChatCompletionToolMessageParam = {
-              role: 'tool',
-              tool_call_id: block.tool_use_id,
-              content: block.content,
-            }
-            result.push(toolMsg)
-          }
-        }
-      }
-    }
-  }
-
-  return result
-}
-
-function toOpenAIUserMessage(msg: LLMMessage): ChatCompletionUserMessageParam {
-  if (msg.content.length === 1 && msg.content[0]?.type === 'text') {
-    return { role: 'user', content: msg.content[0].text }
-  }
-
-  type ContentPart = OpenAI.Chat.ChatCompletionContentPartText | OpenAI.Chat.ChatCompletionContentPartImage
-  const parts: ContentPart[] = []
-
-  for (const block of msg.content) {
-    if (block.type === 'text') {
-      parts.push({ type: 'text', text: block.text })
-    } else if (block.type === 'image') {
-      parts.push({
-        type: 'image_url',
-        image_url: {
-          url: `data:${block.source.media_type};base64,${block.source.data}`,
-        },
-      })
-    }
-  }
-
-  return { role: 'user', content: parts }
-}
-
-function toOpenAIAssistantMessage(msg: LLMMessage): ChatCompletionAssistantMessageParam {
-  const toolCalls: ChatCompletionMessageToolCall[] = []
-  const textParts: string[] = []
-
-  for (const block of msg.content) {
-    if (block.type === 'tool_use') {
-      toolCalls.push({
-        id: block.id,
-        type: 'function',
-        function: {
-          name: block.name,
-          arguments: JSON.stringify(block.input),
-        },
-      })
-    } else if (block.type === 'text') {
-      textParts.push(block.text)
-    }
-  }
-
-  const assistantMsg: ChatCompletionAssistantMessageParam = {
-    role: 'assistant',
-    content: textParts.length > 0 ? textParts.join('') : null,
-  }
-
-  if (toolCalls.length > 0) {
-    assistantMsg.tool_calls = toolCalls
-  }
-
-  return assistantMsg
-}
-
-// ---------------------------------------------------------------------------
-// Internal helpers — OpenAI → framework
-// ---------------------------------------------------------------------------
-
-function fromOpenAICompletion(completion: ChatCompletion): LLMResponse {
-  const choice = completion.choices[0]
-  if (choice === undefined) {
-    throw new Error('Copilot returned a completion with no choices')
-  }
-
-  const content: ContentBlock[] = []
-  const message = choice.message
-
-  if (message.content !== null && message.content !== undefined) {
-    const textBlock: TextBlock = { type: 'text', text: message.content }
-    content.push(textBlock)
-  }
-
-  for (const toolCall of message.tool_calls ?? []) {
-    let parsedInput: Record<string, unknown> = {}
-    try {
-      const parsed: unknown = JSON.parse(toolCall.function.arguments)
-      if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
-        parsedInput = parsed as Record<string, unknown>
-      }
-    } catch {
-      // Malformed arguments — surface as empty object.
-    }
-
-    const toolUseBlock: ToolUseBlock = {
-      type: 'tool_use',
-      id: toolCall.id,
-      name: toolCall.function.name,
-      input: parsedInput,
-    }
-    content.push(toolUseBlock)
-  }
-
-  const stopReason = normalizeFinishReason(choice.finish_reason ?? 'stop')
-
-  return {
-    id: completion.id,
-    content,
-    model: completion.model,
-    stop_reason: stopReason,
-    usage: {
-      input_tokens: completion.usage?.prompt_tokens ?? 0,
-      output_tokens: completion.usage?.completion_tokens ?? 0,
-    },
-  }
-}
-
-function normalizeFinishReason(reason: string): string {
-  switch (reason) {
-    case 'stop':           return 'end_turn'
-    case 'tool_calls':     return 'tool_use'
-    case 'length':         return 'max_tokens'
-    case 'content_filter': return 'content_filter'
-    default:               return reason
-  }
-}
-
-// ---------------------------------------------------------------------------
 // Adapter implementation
 // ---------------------------------------------------------------------------
+
+/** Options for the {@link CopilotAdapter} constructor. */
+export interface CopilotAdapterOptions {
+  /** GitHub OAuth token already scoped for Copilot. Falls back to env vars. */
+  apiKey?: string
+  /**
+   * Callback invoked when the OAuth2 device flow needs user action.
+   * Defaults to printing the verification URI and user code to stdout.
+   */
+  onDeviceCode?: DeviceCodeCallback
+}
 
 /**
  * LLM adapter backed by the GitHub Copilot Chat Completions API.
  *
  * Authentication options (tried in order):
  *   1. `apiKey` constructor arg — a GitHub OAuth token already scoped for Copilot
- *   2. `GITHUB_COPILOT_TOKEN` env var — same as above
- *   3. Interactive OAuth2 device flow — prompts the user to sign in via browser
+ *   2. `GITHUB_COPILOT_TOKEN` env var
+ *   3. `GITHUB_TOKEN` env var
+ *   4. Interactive OAuth2 device flow
  *
  * The GitHub token is exchanged for a short-lived Copilot session token, which
  * is cached and auto-refreshed.
  *
  * Thread-safe — a single instance may be shared across concurrent agent runs.
+ * Concurrent token refreshes are serialised via an internal mutex.
  */
 export class CopilotAdapter implements LLMAdapter {
   readonly name = 'copilot'
@@ -372,17 +231,25 @@ export class CopilotAdapter implements LLMAdapter {
   #githubToken: string | null
   #cachedToken: string | null = null
   #tokenExpiresAt = 0
+  #refreshPromise: Promise<string> | null = null
+  readonly #onDeviceCode: DeviceCodeCallback
 
-  constructor(apiKey?: string) {
-    this.#githubToken = apiKey
+  constructor(apiKeyOrOptions?: string | CopilotAdapterOptions) {
+    const opts = typeof apiKeyOrOptions === 'string'
+      ? { apiKey: apiKeyOrOptions }
+      : apiKeyOrOptions ?? {}
+
+    this.#githubToken = opts.apiKey
       ?? process.env['GITHUB_COPILOT_TOKEN']
       ?? process.env['GITHUB_TOKEN']
       ?? null
+    this.#onDeviceCode = opts.onDeviceCode ?? defaultDeviceCodeCallback
   }
 
   /**
    * Return a valid Copilot session token, refreshing if necessary.
    * If no GitHub token is available, triggers the interactive device flow.
+   * Concurrent calls share a single in-flight refresh to avoid races.
    */
   async #getSessionToken(): Promise<string> {
     const now = Math.floor(Date.now() / 1000)
@@ -390,9 +257,22 @@ export class CopilotAdapter implements LLMAdapter {
       return this.#cachedToken
     }
 
-    // If we don't have a GitHub token yet, do the device flow
+    // If another call is already refreshing, piggyback on that promise
+    if (this.#refreshPromise) {
+      return this.#refreshPromise
+    }
+
+    this.#refreshPromise = this.#doRefresh()
+    try {
+      return await this.#refreshPromise
+    } finally {
+      this.#refreshPromise = null
+    }
+  }
+
+  async #doRefresh(): Promise<string> {
     if (!this.#githubToken) {
-      this.#githubToken = await deviceCodeLogin()
+      this.#githubToken = await deviceCodeLogin(this.#onDeviceCode)
     }
 
     const resp = await fetchCopilotToken(this.#githubToken)
@@ -566,36 +446,6 @@ export class CopilotAdapter implements LLMAdapter {
       yield errorEvent
     }
   }
-}
-
-// ---------------------------------------------------------------------------
-// Private utility
-// ---------------------------------------------------------------------------
-
-function buildOpenAIMessageList(
-  messages: LLMMessage[],
-  systemPrompt: string | undefined,
-): ChatCompletionMessageParam[] {
-  const result: ChatCompletionMessageParam[] = []
-
-  if (systemPrompt !== undefined && systemPrompt.length > 0) {
-    result.push({ role: 'system', content: systemPrompt })
-  }
-
-  result.push(...toOpenAIMessages(messages))
-  return result
-}
-
-// Re-export types that consumers of this module commonly need alongside the adapter.
-export type {
-  ContentBlock,
-  LLMAdapter,
-  LLMChatOptions,
-  LLMMessage,
-  LLMResponse,
-  LLMStreamOptions,
-  LLMToolDef,
-  StreamEvent,
 }
 
 // ---------------------------------------------------------------------------
